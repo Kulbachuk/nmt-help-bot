@@ -15,9 +15,11 @@ from database.db import Database
 from database.models import (
     KIND_ACCENT,
     KIND_DATE,
+    KIND_FOREIGN,
     KIND_MNEMONIC,
     KIND_MONUMENT,
     Accent,
+    ForeignWord,
     HistoryDate,
     Mnemonic,
     Monument,
@@ -33,6 +35,11 @@ def escape(text: str) -> str:
 SUBJECT_HIST = "hist"   # Історія України
 SUBJECT_LANG = "lang"   # Українська мова
 SUBJECT_ANY = "any"     # випадковий предмет
+
+# Теми всередині предмета «Українська мова» (для /now)
+TOPIC_ACCENTS = "acc"   # наголоси та фрази-підказки
+TOPIC_FOREIGN = "for"   # відповідники іншомовних слів
+ALL_TOPICS = (SUBJECT_HIST, SUBJECT_LANG, SUBJECT_ANY, TOPIC_ACCENTS, TOPIC_FOREIGN)
 
 SUBJECT_TITLES = {
     SUBJECT_HIST: "Історія України",
@@ -152,6 +159,16 @@ def make_card(kind: str, item: object) -> Card:
             question=f"Де наголос у слові <b>{escape(item.word.lower())}</b>?",
             answer=f"✅ <b>{escape(to_marked(item.word))}</b> ({escape(item.word)}){note}",
         )
+    if kind == KIND_FOREIGN:
+        assert isinstance(item, ForeignWord)
+        return Card(
+            kind=kind,
+            item_id=item.id,
+            subject=SUBJECT_LANG,
+            header="🌐 Українська мова · Відповідник іншомовного слова",
+            question=f"Який український відповідник має слово <b>{escape(item.word)}</b>?",
+            answer=f"✅ <b>{escape(item.word)}</b> — {escape(item.synonym)}",
+        )
     if kind == KIND_MNEMONIC:
         assert isinstance(item, Mnemonic)
         category = f" · {escape(item.category)}" if item.category else ""
@@ -178,7 +195,11 @@ async def build_card(db: Database, subject: str) -> Card | None:
     if subject == SUBJECT_HIST:
         kinds = [KIND_MONUMENT, KIND_DATE] if random.random() < MONUMENT_CHANCE else [KIND_DATE, KIND_MONUMENT]
     elif subject == SUBJECT_LANG:
+        kinds = random.sample([KIND_ACCENT, KIND_MNEMONIC, KIND_FOREIGN], 3)
+    elif subject == TOPIC_ACCENTS:
         kinds = random.sample([KIND_ACCENT, KIND_MNEMONIC], 2)
+    elif subject == TOPIC_FOREIGN:
+        kinds = [KIND_FOREIGN]
     else:
         logger.warning("Невідомий предмет: %s", subject)
         return None
@@ -204,21 +225,23 @@ def render_back(card: Card) -> str:
     return f"{render_front(card)}\n\n{card.answer}"
 
 
-def card_keyboard(card: Card, revealed: bool = False) -> InlineKeyboardMarkup:
+def card_keyboard(card: Card, revealed: bool = False, more: str | None = None) -> InlineKeyboardMarkup:
+    """Кнопки під карткою. `more` — тема, з якої брати наступну картку (за замовчуванням — предмет картки)."""
+    more = more if more in ALL_TOPICS else card.subject
     rows: list[list[InlineKeyboardButton]] = []
     if not revealed:
         rows.append([
-            InlineKeyboardButton(text="👁 Показати відповідь", callback_data=f"rev:{card.kind}:{card.item_id}")
+            InlineKeyboardButton(text="👁 Показати відповідь", callback_data=f"rev:{card.kind}:{card.item_id}:{more}")
         ])
     rows.append([
-        InlineKeyboardButton(text="🔄 Ще одну картку", callback_data=f"now:{card.subject}")
+        InlineKeyboardButton(text="🔄 Ще одну картку", callback_data=f"now:{more}")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def send_card(bot: Bot, chat_id: int, card: Card) -> Message:
+async def send_card(bot: Bot, chat_id: int, card: Card, more: str | None = None) -> Message:
     """Надсилає картку. Якщо фото недоступне — надсилає текстову версію."""
-    markup = card_keyboard(card)
+    markup = card_keyboard(card, more=more)
     if card.photo:
         try:
             return await bot.send_photo(chat_id, card.photo, caption=render_front(card), reply_markup=markup)

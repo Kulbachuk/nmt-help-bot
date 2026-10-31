@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS accents (
     note TEXT NOT NULL DEFAULT ''
 );
 
+-- Відповідники іншомовних слів: «абзац» -> «відступ»
+CREATE TABLE IF NOT EXISTS foreign_words (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    word    TEXT NOT NULL,
+    synonym TEXT NOT NULL
+);
+
 -- Римовані фрази для запам'ятовування наголосів.
 -- Наголос позначено знаком U+0301 після голосної: «піце́рія»
 CREATE TABLE IF NOT EXISTS mnemonics (
@@ -73,6 +80,13 @@ class Accent:
 
 
 @dataclass(frozen=True, slots=True)
+class ForeignWord:
+    id: int
+    word: str
+    synonym: str
+
+
+@dataclass(frozen=True, slots=True)
 class Mnemonic:
     id: int
     category: str
@@ -91,12 +105,14 @@ class Monument:
 KIND_DATE = "d"
 KIND_ACCENT = "a"
 KIND_MNEMONIC = "n"
+KIND_FOREIGN = "f"
 KIND_MONUMENT = "m"
 
 KIND_TABLES: dict[str, tuple[str, type]] = {
     KIND_DATE: ("history_dates", HistoryDate),
     KIND_ACCENT: ("accents", Accent),
     KIND_MNEMONIC: ("mnemonics", Mnemonic),
+    KIND_FOREIGN: ("foreign_words", ForeignWord),
     KIND_MONUMENT: ("monuments", Monument),
 }
 
@@ -108,4 +124,5 @@ EDITABLE_COLUMNS: dict[str, frozenset[str]] = {
     "accents": frozenset({"word", "note"}),
     "monuments": frozenset({"title", "photo_file_id", "description"}),
     "mnemonics": frozenset({"category", "text"}),
+    "foreign_words": frozenset({"word", "synonym"}),
 }

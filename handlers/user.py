@@ -15,6 +15,9 @@ from services.cards import (
     SUBJECT_ANY,
     SUBJECT_HIST,
     SUBJECT_LANG,
+    TOPIC_ACCENTS,
+    TOPIC_FOREIGN,
+    ALL_TOPICS,
     build_card,
     build_card_by_id,
     card_keyboard,
@@ -27,7 +30,9 @@ router = Router(name="user")
 
 SUBJECT_MENU = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🏛 Історія України", callback_data=f"pick:{SUBJECT_HIST}")],
-    [InlineKeyboardButton(text="🔤 Українська мова", callback_data=f"pick:{SUBJECT_LANG}")],
+    [InlineKeyboardButton(text="🔤 Українська мова (усе)", callback_data=f"pick:{SUBJECT_LANG}")],
+    [InlineKeyboardButton(text="🔊 Наголоси", callback_data=f"pick:{TOPIC_ACCENTS}")],
+    [InlineKeyboardButton(text="🌐 Відповідники іншомовних слів", callback_data=f"pick:{TOPIC_FOREIGN}")],
     [InlineKeyboardButton(text="🎲 Випадково", callback_data=f"pick:{SUBJECT_ANY}")],
 ])
 
@@ -39,7 +44,7 @@ async def cmd_now(message: Message) -> None:
     await message.answer("Який предмет повторимо зараз?", reply_markup=SUBJECT_MENU)
 
 
-@router.callback_query(F.data.regexp(r"^(now|pick):(hist|lang|any)$"))
+@router.callback_query(F.data.regexp(r"^(now|pick):(hist|lang|any|acc|for)$"))
 async def on_get_card(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     prefix, subject = (callback.data or "").split(":", 1)
     await callback.answer()
@@ -63,7 +68,7 @@ async def on_get_card(callback: CallbackQuery, db: Database, bot: Bot) -> None:
             pass
 
     try:
-        await send_card(bot, callback.from_user.id, card)
+        await send_card(bot, callback.from_user.id, card, more=subject)
     except Exception:
         logger.exception("Не вдалося надіслати картку користувачу %s", callback.from_user.id)
 
@@ -72,7 +77,9 @@ async def on_get_card(callback: CallbackQuery, db: Database, bot: Bot) -> None:
 async def on_reveal(callback: CallbackQuery, db: Database) -> None:
     """«Показати відповідь»: редагує повідомлення, додаючи відповідь."""
     try:
-        _, kind, raw_id = (callback.data or "").split(":")
+        parts = (callback.data or "").split(":")
+        kind, raw_id = parts[1], parts[2]
+        more = parts[3] if len(parts) > 3 else None  # тема для «Ще одну картку» (старі кнопки її не мають)
         item_id = int(raw_id)
     except ValueError:
         await callback.answer("Некоректні дані кнопки.", show_alert=True)
@@ -93,7 +100,7 @@ async def on_reveal(callback: CallbackQuery, db: Database) -> None:
         return
 
     text = render_back(card)
-    markup = card_keyboard(card, revealed=True)
+    markup = card_keyboard(card, revealed=True, more=more)
     try:
         if message.photo:
             await message.edit_caption(caption=text, reply_markup=markup)

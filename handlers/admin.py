@@ -21,7 +21,7 @@ from aiogram.types import (
 )
 
 from database.db import Database
-from database.models import KIND_ACCENT, KIND_DATE, KIND_MNEMONIC, KIND_MONUMENT, KIND_TABLES
+from database.models import KIND_ACCENT, KIND_DATE, KIND_FOREIGN, KIND_MNEMONIC, KIND_MONUMENT, KIND_TABLES
 from services.cards import (
     escape,
     highlight_stress,
@@ -43,7 +43,7 @@ async def is_admin(event: TelegramObject, admin_id: int) -> bool:
 router.message.filter(is_admin)
 router.callback_query.filter(is_admin)
 
-KINDS = "[damn]"  # літери типів записів у callback_data (див. database.models)
+KINDS = "[damnf]"  # літери типів записів у callback_data (див. database.models)
 
 
 # ====================================================================== перевірка полів
@@ -98,6 +98,20 @@ def v_description(raw: str) -> Result:
     return description, ""
 
 
+def v_foreign_word(raw: str) -> Result:
+    word = " ".join(raw.split())
+    if not 2 <= len(word) <= 60:
+        return None, "⚠️ Іншомовне слово — від 2 до 60 символів."
+    return word, ""
+
+
+def v_synonym(raw: str) -> Result:
+    synonym = " ".join(raw.split())
+    if not 2 <= len(synonym) <= 150:
+        return None, "⚠️ Український відповідник — від 2 до 150 символів."
+    return synonym, ""
+
+
 def v_category(raw: str) -> Result:
     category = " ".join(raw.split())
     if not 2 <= len(category) <= 40:
@@ -138,6 +152,10 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("d", "description", "Опис", "Введіть новий <b>опис</b> (до 700 символів):", v_description),
         Field("p", "photo_file_id", "Фото", "Надішліть нове <b>фото</b> (саме як фото, не файл):", None),
     ),
+    KIND_FOREIGN: (
+        Field("w", "word", "Іншомовне слово", "Введіть нове <b>іншомовне слово</b>:", v_foreign_word),
+        Field("s", "synonym", "Відповідник", "Введіть новий <b>український відповідник</b> (кілька — через кому):", v_synonym),
+    ),
     KIND_MNEMONIC: (
         Field("c", "category", "Категорію", "Введіть нову <b>категорію</b>:", v_category),
         Field("x", "text", "Фразу", "Введіть нову <b>фразу</b>. Наголос: велика голосна всередині слова (<code>піцЕрія</code>) або знак наголосу (піце́рія):", v_mnemonic),
@@ -171,6 +189,11 @@ class AddMnemonic(StatesGroup):
     text = State()
 
 
+class AddForeign(StatesGroup):
+    word = State()
+    synonym = State()
+
+
 class EditValue(StatesGroup):
     value = State()
 
@@ -181,10 +204,12 @@ KIND_LABELS = {
     KIND_MONUMENT: ("🏛", "Пам'ятки"),
     KIND_ACCENT: ("🔤", "Наголоси"),
     KIND_MNEMONIC: ("🧠", "Фрази для наголосів"),
+    KIND_FOREIGN: ("🌐", "Відповідники іншомовних слів"),
 }
 
 NEED_TEXT = "⚠️ Очікую текстове повідомлення (не команду). Або натисніть /cancel, щоб скасувати."
 PAGE_SIZE = 8
+PAGE_SIZES = {KIND_FOREIGN: 15}  # у розділі іншомовних слів записів багато
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -195,6 +220,7 @@ MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
     [_btn("📅 Додати дату", "adm:date")],
     [_btn("🔤 Додати наголос", "adm:accent")],
     [_btn("🧠 Додати фразу для наголосів", "adm:mnemonic")],
+    [_btn("🌐 Додати відповідник іншомовного слова", "adm:foreign")],
     [_btn("🏛 Додати пам'ятку з фото", "adm:monument")],
     [_btn("📋 Переглянути / редагувати / видалити", "adm:list")],
     [_btn("📊 Статистика", "adm:stats")],
@@ -226,6 +252,8 @@ def _preview(kind: str, item) -> str:
         return to_marked(item.word)
     if kind == KIND_MNEMONIC:
         return item.text
+    if kind == KIND_FOREIGN:
+        return f"{item.word} — {item.synonym}"
     return item.title
 
 
@@ -238,6 +266,8 @@ def _item_text(kind: str, item) -> str:
     if kind == KIND_ACCENT:
         note = f"\nПідказка: {escape(item.note)}" if item.note else "\nПідказка: —"
         return head + f"Слово: <b>{escape(to_marked(item.word))}</b> ({escape(item.word)}){note}"
+    if kind == KIND_FOREIGN:
+        return head + f"Іншомовне слово: <b>{escape(item.word)}</b>\nВідповідник: {escape(item.synonym)}"
     if kind == KIND_MNEMONIC:
         return head + f"Категорія: <b>{escape(item.category or '—')}</b>\n\n{highlight_stress(item.text)}"
     return head + f"<b>{escape(item.title)}</b>\n\n{escape(item.description)}"
@@ -353,7 +383,8 @@ async def cb_stats(callback: CallbackQuery, db: Database) -> None:
         f"📅 Дати: <b>{counts.get('history_dates', 0)}</b>\n"
         f"🏛 Пам'ятки: <b>{counts.get('monuments', 0)}</b>\n"
         f"🔤 Наголоси: <b>{counts.get('accents', 0)}</b>\n"
-        f"🧠 Фрази для наголосів: <b>{counts.get('mnemonics', 0)}</b>"
+        f"🧠 Фрази для наголосів: <b>{counts.get('mnemonics', 0)}</b>\n"
+        f"🌐 Відповідники іншомовних слів: <b>{counts.get('foreign_words', 0)}</b>"
     )
     if isinstance(callback.message, Message):
         await callback.message.answer(text)
@@ -540,6 +571,58 @@ async def add_mnemonic_text(message: Message, state: FSMContext, db: Database) -
     await _show_menu(message)
 
 
+# ====================================================================== додавання відповідника: слово -> відповідник
+@router.callback_query(F.data == "adm:foreign")
+async def cb_add_foreign(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(AddForeign.word)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "🌐 Введіть <b>іншомовне слово</b> (наприклад, <code>абзац</code>):", reply_markup=CANCEL_KB
+        )
+
+
+@router.message(AddForeign.word)
+async def add_foreign_word(message: Message, state: FSMContext) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    word, error = v_foreign_word(raw)
+    if word is None:
+        await message.answer(error)
+        return
+    await state.update_data(word=word)
+    await state.set_state(AddForeign.synonym)
+    await message.answer(
+        f"Слово: <b>{escape(word)}</b>\nТепер введіть <b>український відповідник</b> (кілька — через кому):",
+        reply_markup=CANCEL_KB,
+    )
+
+
+@router.message(AddForeign.synonym)
+async def add_foreign_synonym(message: Message, state: FSMContext, db: Database) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    synonym, error = v_synonym(raw)
+    if synonym is None:
+        await message.answer(error)
+        return
+    data = await state.get_data()
+    try:
+        item_id = await db.add_foreign_word(data["word"], synonym)
+    except Exception:
+        logger.exception("Не вдалося зберегти відповідник")
+        await message.answer("😔 Помилка збереження в базу. Подробиці — у логах.")
+        return
+    await state.clear()
+    logger.info("Адмін додав відповідник #%s (%s)", item_id, data["word"])
+    await message.answer(f"✅ Додано (№{item_id}): <b>{escape(data['word'])}</b> — {escape(synonym)}")
+    await _show_menu(message)
+
+
 # ====================================================================== додавання пам'ятки: фото -> назва -> опис
 @router.callback_query(F.data == "adm:monument")
 async def cb_add_monument(callback: CallbackQuery, state: FSMContext) -> None:
@@ -618,10 +701,11 @@ async def _show_kinds(callback: CallbackQuery, db: Database) -> None:
 
 
 async def _show_list(callback: CallbackQuery, db: Database, kind: str, page: int) -> None:
+    size = PAGE_SIZES.get(kind, PAGE_SIZE)
     total = await db.count(KIND_TABLES[kind][0])
-    pages = max(1, math.ceil(total / PAGE_SIZE))
+    pages = max(1, math.ceil(total / size))
     page = min(max(page, 0), pages - 1)
-    items = await db.list_items(kind, PAGE_SIZE, page * PAGE_SIZE)
+    items = await db.list_items(kind, size, page * size)
     icon, label = KIND_LABELS[kind]
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -633,17 +717,21 @@ async def _show_list(callback: CallbackQuery, db: Database, kind: str, page: int
             + "\n\nОберіть номер, щоб відкрити запис, відредагувати або видалити його:"
         )
         buttons = [_btn(f"№{i.id}", f"adm:it:{kind}:{i.id}:{page}") for i in items]
-        rows += [buttons[n:n + 4] for n in range(0, len(buttons), 4)]
+        rows += [buttons[n:n + 5] for n in range(0, len(buttons), 5)]
     else:
         text = f"{icon} <b>{label}</b>\n\nУ цьому розділі записів немає."
 
     if pages > 1:
         nav = []
+        if pages > 5 and page > 0:
+            nav.append(_btn("⏮", f"adm:ls:{kind}:0"))
         if page > 0:
             nav.append(_btn("⬅️", f"adm:ls:{kind}:{page - 1}"))
         nav.append(_btn(f"{page + 1}/{pages}", "adm:noop"))
         if page < pages - 1:
             nav.append(_btn("➡️", f"adm:ls:{kind}:{page + 1}"))
+        if pages > 5 and page < pages - 1:
+            nav.append(_btn("⏭", f"adm:ls:{kind}:{pages - 1}"))
         rows.append(nav)
     rows.append([_btn("↩️ До розділів", "adm:list")])
     await _show(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))

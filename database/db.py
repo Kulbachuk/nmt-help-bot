@@ -24,6 +24,7 @@ SEED_SOURCES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("history_dates", "dates.json", ("year", "event")),
     ("accents", "accents.json", ("word", "note")),
     ("mnemonics", "mnemonics.json", ("text", "category")),
+    ("foreign_words", "foreign_words.json", ("word", "synonym")),
 )
 
 
@@ -232,6 +233,11 @@ class Database:
     async def add_mnemonic(self, category: str, text: str) -> int:
         return await self._insert(
             "INSERT INTO mnemonics (category, text) VALUES (?, ?)", (category, text)
+        )
+
+    async def add_foreign_word(self, word: str, synonym: str) -> int:
+        return await self._insert(
+            "INSERT INTO foreign_words (word, synonym) VALUES (?, ?)", (word, synonym)
         )
 
     async def list_categories(self) -> list[str]:

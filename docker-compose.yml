@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: nmt-prep-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Europe/Kyiv
+      DB_PATH: /app/storage/bot.db
+    volumes:
+      # SQLite-база та логи переживають перезапуск контейнера
+      - ./storage:/app/storage
+      # Стартові дані (можна редагувати без перебудови образу)
+      - ./data:/app/data

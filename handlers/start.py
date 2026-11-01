@@ -40,7 +40,7 @@ async def cmd_start(message: Message, db: Database) -> None:
 
     logger.info("/start від %s (%s)", user.id, "новий" if is_new else "повторно")
     greeting = f"👋 Вітаю, {user.first_name}!" if user.first_name else "👋 Вітаю!"
-    await message.answer(f"{greeting}\n\n{HELP_TEXT}")
+    await message.answer(f"{greeting}\n\n{HELP_TEXT}\n\nЗроблено для найкоханішої людинки ❤️")
 
 
 @router.message(Command("help"))

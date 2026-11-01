@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS accents (
     note TEXT NOT NULL DEFAULT ''
 );
 
+-- Фразеологізми: «Авгієві стайні» -> значення
+CREATE TABLE IF NOT EXISTS phrases (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    phrase  TEXT NOT NULL,
+    meaning TEXT NOT NULL
+);
+
 -- Відповідники іншомовних слів: «абзац» -> «відступ»
 CREATE TABLE IF NOT EXISTS foreign_words (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +87,13 @@ class Accent:
 
 
 @dataclass(frozen=True, slots=True)
+class Phrase:
+    id: int
+    phrase: str
+    meaning: str
+
+
+@dataclass(frozen=True, slots=True)
 class ForeignWord:
     id: int
     word: str
@@ -106,6 +120,7 @@ KIND_DATE = "d"
 KIND_ACCENT = "a"
 KIND_MNEMONIC = "n"
 KIND_FOREIGN = "f"
+KIND_PHRASE = "r"
 KIND_MONUMENT = "m"
 
 KIND_TABLES: dict[str, tuple[str, type]] = {
@@ -113,6 +128,7 @@ KIND_TABLES: dict[str, tuple[str, type]] = {
     KIND_ACCENT: ("accents", Accent),
     KIND_MNEMONIC: ("mnemonics", Mnemonic),
     KIND_FOREIGN: ("foreign_words", ForeignWord),
+    KIND_PHRASE: ("phrases", Phrase),
     KIND_MONUMENT: ("monuments", Monument),
 }
 
@@ -125,4 +141,5 @@ EDITABLE_COLUMNS: dict[str, frozenset[str]] = {
     "monuments": frozenset({"title", "photo_file_id", "description"}),
     "mnemonics": frozenset({"category", "text"}),
     "foreign_words": frozenset({"word", "synonym"}),
+    "phrases": frozenset({"phrase", "meaning"}),
 }

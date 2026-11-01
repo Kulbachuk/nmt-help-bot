@@ -17,6 +17,7 @@ from services.cards import (
     SUBJECT_LANG,
     TOPIC_ACCENTS,
     TOPIC_FOREIGN,
+    TOPIC_PHRASES,
     ALL_TOPICS,
     build_card,
     build_card_by_id,
@@ -33,6 +34,7 @@ SUBJECT_MENU = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔤 Українська мова (усе)", callback_data=f"pick:{SUBJECT_LANG}")],
     [InlineKeyboardButton(text="🔊 Наголоси", callback_data=f"pick:{TOPIC_ACCENTS}")],
     [InlineKeyboardButton(text="🌐 Відповідники іншомовних слів", callback_data=f"pick:{TOPIC_FOREIGN}")],
+    [InlineKeyboardButton(text="💬 Фразеологізми", callback_data=f"pick:{TOPIC_PHRASES}")],
     [InlineKeyboardButton(text="🎲 Випадково", callback_data=f"pick:{SUBJECT_ANY}")],
 ])
 
@@ -44,7 +46,7 @@ async def cmd_now(message: Message) -> None:
     await message.answer("Який предмет повторимо зараз?", reply_markup=SUBJECT_MENU)
 
 
-@router.callback_query(F.data.regexp(r"^(now|pick):(hist|lang|any|acc|for)$"))
+@router.callback_query(F.data.regexp(r"^(now|pick):(hist|lang|any|acc|for|phr)$"))
 async def on_get_card(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     prefix, subject = (callback.data or "").split(":", 1)
     await callback.answer()

@@ -21,8 +21,17 @@ from aiogram.types import (
 )
 
 from database.db import Database
-from database.models import KIND_ACCENT, KIND_DATE, KIND_FOREIGN, KIND_MNEMONIC, KIND_MONUMENT, KIND_TABLES
+from database.models import (
+    KIND_ACCENT,
+    KIND_DATE,
+    KIND_FOREIGN,
+    KIND_MNEMONIC,
+    KIND_MONUMENT,
+    KIND_PHRASE,
+    KIND_TABLES,
+)
 from services.cards import (
+    accent_variants,
     escape,
     highlight_stress,
     normalize_accent_word,
@@ -43,7 +52,7 @@ async def is_admin(event: TelegramObject, admin_id: int) -> bool:
 router.message.filter(is_admin)
 router.callback_query.filter(is_admin)
 
-KINDS = "[damnf]"  # літери типів записів у callback_data (див. database.models)
+KINDS = "[damnfr]"  # літери типів записів у callback_data (див. database.models)
 
 
 # ====================================================================== перевірка полів
@@ -69,8 +78,9 @@ def v_word(raw: str) -> Result:
     word = normalize_accent_word(raw)
     if word is None:
         return None, (
-            "⚠️ Потрібне одне слово рівно з одним наголосом: наголошена голосна — велика, "
-            "решта літер — малі. Приклад: <code>дОговір</code>."
+            "⚠️ Потрібне одне слово з одним наголосом: наголошена голосна — велика, решта літер — малі "
+            "(приклад: <code>каталОг</code>). Якщо допустимі два варіанти — дві великі голосні "
+            "(<code>мАбУть</code>)."
         )
     return word, ""
 
@@ -110,6 +120,20 @@ def v_synonym(raw: str) -> Result:
     if not 2 <= len(synonym) <= 150:
         return None, "⚠️ Український відповідник — від 2 до 150 символів."
     return synonym, ""
+
+
+def v_phrase(raw: str) -> Result:
+    phrase = " ".join(raw.split()).strip("«»\"")
+    if not 2 <= len(phrase) <= 120:
+        return None, "⚠️ Фразеологізм — від 2 до 120 символів."
+    return phrase, ""
+
+
+def v_meaning(raw: str) -> Result:
+    meaning = " ".join(raw.split())
+    if not 3 <= len(meaning) <= 500:
+        return None, "⚠️ Значення — від 3 до 500 символів."
+    return meaning, ""
 
 
 def v_category(raw: str) -> Result:
@@ -152,6 +176,10 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("d", "description", "Опис", "Введіть новий <b>опис</b> (до 700 символів):", v_description),
         Field("p", "photo_file_id", "Фото", "Надішліть нове <b>фото</b> (саме як фото, не файл):", None),
     ),
+    KIND_PHRASE: (
+        Field("p", "phrase", "Фразеологізм", "Введіть новий <b>фразеологізм</b> (без лапок):", v_phrase),
+        Field("m", "meaning", "Значення", "Введіть нове <b>значення</b>:", v_meaning),
+    ),
     KIND_FOREIGN: (
         Field("w", "word", "Іншомовне слово", "Введіть нове <b>іншомовне слово</b>:", v_foreign_word),
         Field("s", "synonym", "Відповідник", "Введіть новий <b>український відповідник</b> (кілька — через кому):", v_synonym),
@@ -189,6 +217,11 @@ class AddMnemonic(StatesGroup):
     text = State()
 
 
+class AddPhrase(StatesGroup):
+    phrase = State()
+    meaning = State()
+
+
 class AddForeign(StatesGroup):
     word = State()
     synonym = State()
@@ -205,11 +238,12 @@ KIND_LABELS = {
     KIND_ACCENT: ("🔤", "Наголоси"),
     KIND_MNEMONIC: ("🧠", "Фрази для наголосів"),
     KIND_FOREIGN: ("🌐", "Відповідники іншомовних слів"),
+    KIND_PHRASE: ("💬", "Фразеологізми"),
 }
 
 NEED_TEXT = "⚠️ Очікую текстове повідомлення (не команду). Або натисніть /cancel, щоб скасувати."
 PAGE_SIZE = 8
-PAGE_SIZES = {KIND_FOREIGN: 15}  # у розділі іншомовних слів записів багато
+PAGE_SIZES = {KIND_FOREIGN: 15, KIND_PHRASE: 15, KIND_ACCENT: 15}  # у цих розділах записів багато
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -221,6 +255,7 @@ MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
     [_btn("🔤 Додати наголос", "adm:accent")],
     [_btn("🧠 Додати фразу для наголосів", "adm:mnemonic")],
     [_btn("🌐 Додати відповідник іншомовного слова", "adm:foreign")],
+    [_btn("💬 Додати фразеологізм", "adm:phrase")],
     [_btn("🏛 Додати пам'ятку з фото", "adm:monument")],
     [_btn("📋 Переглянути / редагувати / видалити", "adm:list")],
     [_btn("📊 Статистика", "adm:stats")],
@@ -249,9 +284,11 @@ def _preview(kind: str, item) -> str:
     if kind == KIND_DATE:
         return f"{item.year} — {item.event}"
     if kind == KIND_ACCENT:
-        return to_marked(item.word)
+        return " і ".join(accent_variants(item.word))
     if kind == KIND_MNEMONIC:
         return item.text
+    if kind == KIND_PHRASE:
+        return f"{item.phrase} — {item.meaning}"
     if kind == KIND_FOREIGN:
         return f"{item.word} — {item.synonym}"
     return item.title
@@ -265,7 +302,10 @@ def _item_text(kind: str, item) -> str:
         return head + f"Рік: <b>{escape(item.year)}</b>\nПодія: {escape(item.event)}"
     if kind == KIND_ACCENT:
         note = f"\nПідказка: {escape(item.note)}" if item.note else "\nПідказка: —"
-        return head + f"Слово: <b>{escape(to_marked(item.word))}</b> ({escape(item.word)}){note}"
+        shown = " і ".join(accent_variants(item.word))
+        return head + f"Слово: <b>{escape(shown)}</b> ({escape(item.word)}){note}"
+    if kind == KIND_PHRASE:
+        return head + f"Фразеологізм: <b>{escape(item.phrase)}</b>\nЗначення: {escape(item.meaning)}"
     if kind == KIND_FOREIGN:
         return head + f"Іншомовне слово: <b>{escape(item.word)}</b>\nВідповідник: {escape(item.synonym)}"
     if kind == KIND_MNEMONIC:
@@ -384,7 +424,8 @@ async def cb_stats(callback: CallbackQuery, db: Database) -> None:
         f"🏛 Пам'ятки: <b>{counts.get('monuments', 0)}</b>\n"
         f"🔤 Наголоси: <b>{counts.get('accents', 0)}</b>\n"
         f"🧠 Фрази для наголосів: <b>{counts.get('mnemonics', 0)}</b>\n"
-        f"🌐 Відповідники іншомовних слів: <b>{counts.get('foreign_words', 0)}</b>"
+        f"🌐 Відповідники іншомовних слів: <b>{counts.get('foreign_words', 0)}</b>\n"
+        f"💬 Фразеологізми: <b>{counts.get('phrases', 0)}</b>"
     )
     if isinstance(callback.message, Message):
         await callback.message.answer(text)
@@ -568,6 +609,57 @@ async def add_mnemonic_text(message: Message, state: FSMContext, db: Database) -
     await state.clear()
     logger.info("Адмін додав фразу #%s (%s)", item_id, data["category"])
     await message.answer(f"✅ Фразу додано (№{item_id}):\n{highlight_stress(text)}")
+    await _show_menu(message)
+
+
+# ====================================================================== додавання фразеологізму: фраза -> значення
+@router.callback_query(F.data == "adm:phrase")
+async def cb_add_phrase(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(AddPhrase.phrase)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "💬 Введіть <b>фразеологізм</b> (наприклад, <code>Авгієві стайні</code>):", reply_markup=CANCEL_KB
+        )
+
+
+@router.message(AddPhrase.phrase)
+async def add_phrase_text(message: Message, state: FSMContext) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    phrase, error = v_phrase(raw)
+    if phrase is None:
+        await message.answer(error)
+        return
+    await state.update_data(phrase=phrase)
+    await state.set_state(AddPhrase.meaning)
+    await message.answer(
+        f"Фразеологізм: <b>{escape(phrase)}</b>\nТепер введіть його <b>значення</b>:", reply_markup=CANCEL_KB
+    )
+
+
+@router.message(AddPhrase.meaning)
+async def add_phrase_meaning(message: Message, state: FSMContext, db: Database) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    meaning, error = v_meaning(raw)
+    if meaning is None:
+        await message.answer(error)
+        return
+    data = await state.get_data()
+    try:
+        item_id = await db.add_phrase(data["phrase"], meaning)
+    except Exception:
+        logger.exception("Не вдалося зберегти фразеологізм")
+        await message.answer("😔 Помилка збереження в базу. Подробиці — у логах.")
+        return
+    await state.clear()
+    logger.info("Адмін додав фразеологізм #%s (%s)", item_id, data["phrase"])
+    await message.answer(f"✅ Додано (№{item_id}): <b>{escape(data['phrase'])}</b> — {escape(meaning)}")
     await _show_menu(message)
 
 

@@ -18,11 +18,13 @@ from database.models import (
     KIND_FOREIGN,
     KIND_MNEMONIC,
     KIND_MONUMENT,
+    KIND_PHRASE,
     Accent,
     ForeignWord,
     HistoryDate,
     Mnemonic,
     Monument,
+    Phrase,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,8 @@ SUBJECT_ANY = "any"     # випадковий предмет
 # Теми всередині предмета «Українська мова» (для /now)
 TOPIC_ACCENTS = "acc"   # наголоси та фрази-підказки
 TOPIC_FOREIGN = "for"   # відповідники іншомовних слів
-ALL_TOPICS = (SUBJECT_HIST, SUBJECT_LANG, SUBJECT_ANY, TOPIC_ACCENTS, TOPIC_FOREIGN)
+TOPIC_PHRASES = "phr"   # фразеологізми
+ALL_TOPICS = (SUBJECT_HIST, SUBJECT_LANG, SUBJECT_ANY, TOPIC_ACCENTS, TOPIC_FOREIGN, TOPIC_PHRASES)
 
 SUBJECT_TITLES = {
     SUBJECT_HIST: "Історія України",
@@ -73,11 +76,26 @@ def normalize_accent_word(raw: str) -> str | None:
     if not 2 <= len(word) <= 40 or " " in word:
         return None
     stressed = [ch for ch in word if ch in VOWELS_UPPER]
-    if len(stressed) != 1:
+    if not 1 <= len(stressed) <= 2:  # 2 наголоси = допустимі обидва варіанти
         return None
     if any(ch.isupper() and ch not in VOWELS_UPPER for ch in word):
         return None
     return word
+
+
+def accent_variants(word: str) -> list[str]:
+    """Усі допустимі варіанти наголосу слова зі знаком наголосу.
+
+    «алфАвІт» -> ['алфа́віт', 'алфаві́т'];  «бАрмен» -> ['ба́рмен'].
+    """
+    positions = [i for i, ch in enumerate(word) if ch in VOWELS_UPPER]
+    variants = []
+    for pos in positions:
+        variants.append("".join(
+            (ch.lower() + ACUTE if i == pos else ch.lower()) if ch in VOWELS_UPPER else ch
+            for i, ch in enumerate(word)
+        ))
+    return variants
 
 
 def to_marked(word: str) -> str:
@@ -150,14 +168,29 @@ def make_card(kind: str, item: object) -> Card:
         )
     if kind == KIND_ACCENT:
         assert isinstance(item, Accent)
-        note = f"\n{escape(item.note)}" if item.note else ""
+        # Підказка може починатися з уточнення в дужках: «(користь) Наголос на 1-му складі.»
+        match = re.match(r"^\(([^)]+)\)\s*(.*)$", item.note or "", re.S)
+        qualifier, note_text = (match.group(1), match.group(2)) if match else ("", item.note or "")
+        hint = f" (<i>{escape(qualifier)}</i>)" if qualifier else ""
+        variants = " і ".join(f"<b>{escape(v)}</b>" for v in accent_variants(item.word))
+        note = f"\n{escape(note_text)}" if note_text else ""
         return Card(
             kind=kind,
             item_id=item.id,
             subject=SUBJECT_LANG,
             header="🔤 Українська мова · Наголос",
-            question=f"Де наголос у слові <b>{escape(item.word.lower())}</b>?",
-            answer=f"✅ <b>{escape(to_marked(item.word))}</b> ({escape(item.word)}){note}",
+            question=f"Де наголос у слові <b>{escape(item.word.lower())}</b>{hint}?",
+            answer=f"✅ {variants}{note}",
+        )
+    if kind == KIND_PHRASE:
+        assert isinstance(item, Phrase)
+        return Card(
+            kind=kind,
+            item_id=item.id,
+            subject=SUBJECT_LANG,
+            header="💬 Українська мова · Фразеологізм",
+            question=f"Що означає фразеологізм <b>«{escape(item.phrase)}»</b>?",
+            answer=f"✅ {escape(item.meaning)}",
         )
     if kind == KIND_FOREIGN:
         assert isinstance(item, ForeignWord)
@@ -195,11 +228,13 @@ async def build_card(db: Database, subject: str) -> Card | None:
     if subject == SUBJECT_HIST:
         kinds = [KIND_MONUMENT, KIND_DATE] if random.random() < MONUMENT_CHANCE else [KIND_DATE, KIND_MONUMENT]
     elif subject == SUBJECT_LANG:
-        kinds = random.sample([KIND_ACCENT, KIND_MNEMONIC, KIND_FOREIGN], 3)
+        kinds = random.sample([KIND_ACCENT, KIND_MNEMONIC, KIND_FOREIGN, KIND_PHRASE], 4)
     elif subject == TOPIC_ACCENTS:
         kinds = random.sample([KIND_ACCENT, KIND_MNEMONIC], 2)
     elif subject == TOPIC_FOREIGN:
         kinds = [KIND_FOREIGN]
+    elif subject == TOPIC_PHRASES:
+        kinds = [KIND_PHRASE]
     else:
         logger.warning("Невідомий предмет: %s", subject)
         return None

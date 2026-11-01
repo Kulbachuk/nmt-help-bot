@@ -25,6 +25,7 @@ SEED_SOURCES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("accents", "accents.json", ("word", "note")),
     ("mnemonics", "mnemonics.json", ("text", "category")),
     ("foreign_words", "foreign_words.json", ("word", "synonym")),
+    ("phrases", "phrases.json", ("phrase", "meaning")),
 )
 
 
@@ -63,6 +64,7 @@ class Database:
         logger.info("Схему БД перевірено/створено")
         await self._migrate()
         await self.seed(data_dir)
+        await self.import_packs(data_dir)
 
     # Виправлення стартових наголосів, помилково записаних у ранніх версіях seed.
     # Спрацьовують лише якщо запис не чіпали (слово збігається дослівно). Ідемпотентні.
@@ -70,6 +72,10 @@ class Database:
         ("гуртожИток", "гуртОжиток", "Наголос на 2-му складі."),
         ("зАвдання", "завдАння", "Наголос на 2-му складі."),
         ("шОфер", "шофЕр", "Наголос на 2-му (останньому) складі."),
+        # за переліком НМТ-2025 ці слова мають два допустимі наголоси
+        ("алфавІт", "алфАвІт", "Допустимі два наголоси: на 2-му та 3-му складах."),
+        ("зАвжди", "зАвждИ", "Допустимі два наголоси: на 1-му та 2-му складах."),
+        ("дОговір", "дОговІр", "Допустимі два наголоси: на 1-му та 3-му складах."),
     )
     ACCENT_REMOVE: tuple[str, ...] = ("дОцент",)  # наголос не підтверджено офіційним переліком
 
@@ -109,6 +115,41 @@ class Database:
         return cursor.lastrowid or 0
 
     # ------------------------------------------------------------------ seed
+    @staticmethod
+    async def _load_rows(path: Path, fields: tuple[str, ...]) -> list[tuple[str, ...]] | None:
+        """Читає JSON-масив і повертає кортежі значень полів. None — файл відсутній/пошкоджений."""
+        try:
+            raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
+            items = json.loads(raw)
+        except FileNotFoundError:
+            logger.warning("Seed: файл %s не знайдено", path)
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("Seed: не вдалося прочитати %s: %s", path, exc)
+            return None
+        if not isinstance(items, list):
+            logger.error("Seed: %s має містити JSON-масив", path)
+            return None
+
+        rows: list[tuple[str, ...]] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                logger.warning("Seed: %s[%d] — не об'єкт, пропускаю", path.name, index)
+                continue
+            values = tuple(str(item.get(field, "")).strip() for field in fields)
+            if not values[0]:
+                logger.warning("Seed: %s[%d] — порожнє поле «%s», пропускаю", path.name, index, fields[0])
+                continue
+            rows.append(values)
+        return rows
+
+    async def _insert_rows(self, table: str, fields: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
+        placeholders = ", ".join("?" for _ in fields)
+        await self.conn.executemany(
+            f"INSERT INTO {table} ({', '.join(fields)}) VALUES ({placeholders})", rows
+        )
+        await self.conn.commit()
+
     async def seed(self, data_dir: Path) -> None:
         """Якщо таблиця порожня — завантажує стартові дані з data/*.json."""
         for table, filename, fields in SEED_SOURCES:
@@ -116,43 +157,35 @@ class Database:
             if existing:
                 logger.info("Seed: таблиця %s вже містить %d записів — пропускаю", table, existing)
                 continue
-
-            path = data_dir / filename
-            try:
-                raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
-                items = json.loads(raw)
-            except FileNotFoundError:
-                logger.warning("Seed: файл %s не знайдено — таблиця %s залишається порожньою", path, table)
-                continue
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.error("Seed: не вдалося прочитати %s: %s", path, exc)
-                continue
-
-            if not isinstance(items, list):
-                logger.error("Seed: %s має містити JSON-масив", path)
-                continue
-
-            rows: list[tuple[str, ...]] = []
-            for index, item in enumerate(items):
-                if not isinstance(item, dict):
-                    logger.warning("Seed: %s[%d] — не об'єкт, пропускаю", filename, index)
-                    continue
-                values = tuple(str(item.get(field, "")).strip() for field in fields)
-                if not values[0]:
-                    logger.warning("Seed: %s[%d] — порожнє поле «%s», пропускаю", filename, index, fields[0])
-                    continue
-                rows.append(values)
-
+            rows = await self._load_rows(data_dir / filename, fields)
             if not rows:
-                logger.warning("Seed: у %s немає коректних записів", filename)
+                logger.warning("Seed: таблиця %s залишається порожньою", table)
                 continue
-
-            placeholders = ", ".join("?" for _ in fields)
-            await self.conn.executemany(
-                f"INSERT INTO {table} ({', '.join(fields)}) VALUES ({placeholders})", rows
-            )
-            await self.conn.commit()
+            await self._insert_rows(table, fields, rows)
             logger.info("Seed: у таблицю %s додано %d записів з %s", table, len(rows), filename)
+
+    # Одноразове донаповнення вже заселених таблиць новими матеріалами з data/*.json.
+    # (таблиця, файл, ключове поле, поля, прапорець у meta). Додаються лише відсутні за ключем
+    # записи, і лише один раз: видалені адміном записи при наступних запусках не повертаються.
+    IMPORT_PACKS: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
+        ("accents", "accents.json", "word", ("word", "note"), "pack:accents_nmt2025"),
+        ("mnemonics", "mnemonics.json", "text", ("text", "category"), "pack:mnemonics_rules_v1"),
+    )
+
+    async def import_packs(self, data_dir: Path) -> None:
+        for table, filename, key, fields, flag in self.IMPORT_PACKS:
+            if await self.get_meta(flag):
+                continue
+            rows = await self._load_rows(data_dir / filename, fields)
+            if rows is None:
+                continue  # файл тимчасово недоступний — спробуємо наступного разу
+            key_index = fields.index(key)
+            existing = {row[0] for row in await self._fetchall(f"SELECT {key} FROM {table}")}
+            fresh = [row for row in rows if row[key_index] not in existing]
+            if fresh:
+                await self._insert_rows(table, fields, fresh)
+            await self.set_meta(flag, "1")
+            logger.info("Пакет %s: у таблицю %s додано %d нових записів", flag, table, len(fresh))
 
     # ------------------------------------------------------------------ користувачі
     async def upsert_user(self, user_id: int) -> bool:
@@ -234,6 +267,9 @@ class Database:
         return await self._insert(
             "INSERT INTO mnemonics (category, text) VALUES (?, ?)", (category, text)
         )
+
+    async def add_phrase(self, phrase: str, meaning: str) -> int:
+        return await self._insert("INSERT INTO phrases (phrase, meaning) VALUES (?, ?)", (phrase, meaning))
 
     async def add_foreign_word(self, word: str, synonym: str) -> int:
         return await self._insert(

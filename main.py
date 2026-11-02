@@ -10,15 +10,16 @@ from pathlib import Path
 
 import pytz
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeChat, ErrorEvent
+from aiogram.types import BotCommand, BotCommandScopeChat, ErrorEvent, User
 from dotenv import load_dotenv
 
 from database.db import Database
 from handlers import admin, start, user
-from services.scheduler import setup_scheduler
+from services.scheduler import schedule_catch_up, setup_scheduler
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -50,6 +51,27 @@ def setup_logging(level_name: str, log_file: Path) -> None:
 def resolve_db_path() -> Path:
     path = Path(os.getenv("DB_PATH", "storage/bot.db"))
     return path if path.is_absolute() else BASE_DIR / path
+
+
+async def wait_for_telegram(bot: Bot) -> User:
+    """Чекає, поки з'явиться інтернет (після відключення світла роутер часто вмикається пізніше за ноутбук).
+
+    Без цього бот падав би при старті й «крутився» у перезапусках Docker.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await bot.get_me()
+        except TelegramUnauthorizedError:
+            raise  # невірний токен — чекати немає сенсу
+        except Exception as exc:
+            attempt += 1
+            delay = min(60, 5 * attempt)
+            logger.warning(
+                "Telegram недоступний (%s: %s). Спроба %d, наступна через %d с",
+                type(exc).__name__, exc, attempt, delay,
+            )
+            await asyncio.sleep(delay)
 
 
 async def main() -> None:
@@ -91,32 +113,35 @@ async def main() -> None:
         logger.error("Необроблена помилка в апдейті: %s", event.exception, exc_info=event.exception)
         return True  # помилку оброблено, бот продовжує працювати
 
-    scheduler = setup_scheduler(bot, db, tz)
+    scheduler, broadcaster = setup_scheduler(bot, db, tz)
 
     try:
-        user_commands = [
-            BotCommand(command="start", description="Реєстрація та інструкція"),
-            BotCommand(command="now", description="Отримати картку зараз"),
-            BotCommand(command="quiet", description="Налаштувати тихий режим"),
-            BotCommand(command="stop", description="Призупинити розсилку"),
-            BotCommand(command="help", description="Довідка"),
-        ]
-        await bot.set_my_commands(user_commands)
-        await bot.set_my_commands(
-            user_commands + [BotCommand(command="admin", description="Адмін-панель")],
-            scope=BotCommandScopeChat(chat_id=admin_id),
-        )
-    except Exception:
-        logger.exception("Не вдалося встановити меню команд (не критично)")
+        me = await wait_for_telegram(bot)
 
-    scheduler.start()
-    try:
-        me = await bot.get_me()
+        try:
+            user_commands = [
+                BotCommand(command="start", description="Реєстрація та інструкція"),
+                BotCommand(command="now", description="Отримати картку зараз"),
+                BotCommand(command="quiet", description="Налаштувати тихий режим"),
+                BotCommand(command="stop", description="Призупинити розсилку"),
+                BotCommand(command="help", description="Довідка"),
+            ]
+            await bot.set_my_commands(user_commands)
+            await bot.set_my_commands(
+                user_commands + [BotCommand(command="admin", description="Адмін-панель")],
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception:
+            logger.exception("Не вдалося встановити меню команд (не критично)")
+
+        scheduler.start()
+        schedule_catch_up(scheduler, broadcaster, tz)  # якщо була пауза — надішле одну пропущену картку
         logger.info("Бот @%s запущено. Адмін: %s, часовий пояс: %s", me.username, admin_id, tz_name)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Зупинка бота...")
-        scheduler.shutdown(wait=False)
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
         await bot.session.close()
         await db.close()
 

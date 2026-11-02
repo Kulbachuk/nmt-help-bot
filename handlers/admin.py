@@ -60,11 +60,15 @@ KINDS = "[damnfr]"  # літери типів записів у callback_data (�
 Result = tuple["str | None", str]
 
 
-def v_year(raw: str) -> Result:
-    year = raw.strip()
-    if not re.fullmatch(r"\d{3,4}(\s*[–—-]\s*\d{3,4})?", year):
-        return None, "⚠️ Некоректний рік. Приклад: <code>988</code> або <code>1932–1933</code>."
-    return re.sub(r"\s*[—-]\s*", "–", year), ""
+def v_date(raw: str) -> Result:
+    """Дата — вільний текст: рік, період, місяць і рік, століття («988», «1932–1933», «травень 1648», «VII–III ст. до н. е.»)."""
+    date = " ".join(raw.split())
+    if not 1 <= len(date) <= 60:
+        return None, (
+            "⚠️ Дата — від 1 до 60 символів. Приклади: <code>988</code>, <code>1932–1933</code>, "
+            "<code>травень 1648</code>, <code>22 січня 1919</code>."
+        )
+    return date, ""
 
 
 def v_event(raw: str) -> Result:
@@ -164,7 +168,7 @@ class Field:
 
 FIELDS: dict[str, tuple[Field, ...]] = {
     KIND_DATE: (
-        Field("y", "year", "Рік", "Введіть новий <b>рік</b> (наприклад, <code>988</code> або <code>1932–1933</code>):", v_year),
+        Field("y", "year", "Дату", "Введіть нову <b>дату</b> (рік, період або місяць і рік: <code>988</code>, <code>1932–1933</code>, <code>травень 1648</code>):", v_date),
         Field("e", "event", "Подію", "Введіть нову <b>подію</b> (без року в тексті — рік є відповіддю):", v_event),
     ),
     KIND_ACCENT: (
@@ -243,7 +247,7 @@ KIND_LABELS = {
 
 NEED_TEXT = "⚠️ Очікую текстове повідомлення (не команду). Або натисніть /cancel, щоб скасувати."
 PAGE_SIZE = 8
-PAGE_SIZES = {KIND_FOREIGN: 15, KIND_PHRASE: 15, KIND_ACCENT: 15}  # у цих розділах записів багато
+PAGE_SIZES = {KIND_FOREIGN: 15, KIND_PHRASE: 15, KIND_ACCENT: 15, KIND_DATE: 15}  # у цих розділах записів багато
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -299,7 +303,7 @@ def _item_text(kind: str, item) -> str:
     icon, label = KIND_LABELS[kind]
     head = f"{icon} <b>{label}</b> · №{item.id}\n\n"
     if kind == KIND_DATE:
-        return head + f"Рік: <b>{escape(item.year)}</b>\nПодія: {escape(item.event)}"
+        return head + f"Дата: <b>{escape(item.year)}</b>\nПодія: {escape(item.event)}"
     if kind == KIND_ACCENT:
         note = f"\nПідказка: {escape(item.note)}" if item.note else "\nПідказка: —"
         shown = " і ".join(accent_variants(item.word))
@@ -437,7 +441,11 @@ async def cb_add_date(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(AddDate.year)
     if isinstance(callback.message, Message):
-        await callback.message.answer(FIELDS[KIND_DATE][0].prompt.replace("новий ", ""), reply_markup=CANCEL_KB)
+        await callback.message.answer(
+            "📅 Введіть <b>дату</b>: рік, період або місяць і рік "
+            "(<code>988</code>, <code>1932–1933</code>, <code>травень 1648</code>):",
+            reply_markup=CANCEL_KB,
+        )
 
 
 @router.message(AddDate.year)
@@ -446,14 +454,14 @@ async def add_date_year(message: Message, state: FSMContext) -> None:
     if raw is None:
         await message.answer(NEED_TEXT)
         return
-    year, error = v_year(raw)
+    year, error = v_date(raw)
     if year is None:
         await message.answer(error)
         return
     await state.update_data(year=year)
     await state.set_state(AddDate.event)
     await message.answer(
-        f"Рік: <b>{escape(year)}</b>\nТепер введіть <b>подію</b> (без року в тексті, адже рік буде відповіддю):",
+        f"Дата: <b>{escape(year)}</b>\nТепер введіть <b>подію</b> (без дати в тексті, адже дата буде відповіддю):",
         reply_markup=CANCEL_KB,
     )
 

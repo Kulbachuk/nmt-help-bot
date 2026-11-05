@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +13,11 @@ import aiosqlite
 from database.models import (
     ALLOWED_TABLES,
     EDITABLE_COLUMNS,
+    EDITABLE_USER_FIELDS,
     KIND_TABLES,
+    READ_SOURCES,
     SCHEMA,
+    USER_COLUMNS,
     User,
 )
 
@@ -49,6 +53,8 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
+        # LOWER() у SQLite не розуміє кирилицю — реєструємо свою функцію для пошуку
+        await self._conn.create_function("ulower", 1, lambda s: s.lower() if isinstance(s, str) else s, deterministic=True)
         logger.info("Підключено до SQLite: %s", self.path)
 
     async def close(self) -> None:
@@ -112,8 +118,32 @@ class Database:
         ('2013–2014', 'Революція Гідності.'),
     )
 
+    async def _ensure_columns(self, table: str, columns: dict[str, str]) -> list[str]:
+        """Додає в існуючу таблицю відсутні колонки. Повертає імена доданих."""
+        rows = await self._fetchall(f"PRAGMA table_info({table})")
+        have = {row["name"] for row in rows}
+        added = []
+        for name, ddl in columns.items():
+            if name not in have:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                added.append(name)
+        if added:
+            await self.conn.commit()
+            logger.info("Міграція: у таблицю %s додано колонки %s", table, ", ".join(added))
+        return added
+
     async def _migrate(self) -> None:
         """Невеликі міграції при оновленні бота."""
+        added = await self._ensure_columns("users", USER_COLUMNS)
+        if "last_subject" in added:
+            # переносимо глобальний стан розсилки в налаштування користувачів
+            subject = await self.get_meta("last_subject")
+            last_run = await self.get_meta("last_broadcast_at")
+            await self.conn.execute(
+                "UPDATE users SET last_subject = ?, last_sent_at = ?", (subject or "", last_run or "")
+            )
+            await self.conn.commit()
+
         if not await self.get_meta("pack:dates_nmt_v1"):
             removed = 0
             for year, event in self.LEGACY_DATES:
@@ -259,12 +289,34 @@ class Database:
 
     @staticmethod
     def _to_user(row: aiosqlite.Row) -> User:
-        return User(
-            user_id=row["user_id"],
-            quiet_start=row["quiet_start"],
-            quiet_end=row["quiet_end"],
-            is_active=bool(row["is_active"]),
+        data = dict(row)
+        data["is_active"] = bool(data["is_active"])
+        data["word_of_day"] = bool(data.get("word_of_day", 1))
+        return User(**{key: data[key] for key in User.__dataclass_fields__ if key in data})
+
+    async def update_user(self, user_id: int, **fields: Any) -> None:
+        """Оновлює налаштування користувача (лише дозволені поля)."""
+        bad = set(fields) - EDITABLE_USER_FIELDS
+        if bad or not fields:
+            raise ValueError(f"Недозволені поля users: {bad or 'порожній запит'}")
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
+        await self.conn.execute(f"UPDATE users SET {assignments} WHERE user_id = ?", (*values, user_id))
+        await self.conn.commit()
+
+    async def mark_sent(self, user_id: int, subject: str, now_iso: str, today: str) -> None:
+        """Фіксує, що користувачу надіслано планову картку (для чергування, інтервалу та ліміту)."""
+        await self.conn.execute(
+            "UPDATE users SET last_subject = ?, last_sent_at = ?, "
+            "sent_today = (CASE WHEN sent_date = ? THEN sent_today ELSE 0 END) + 1, sent_date = ? "
+            "WHERE user_id = ?",
+            (subject, now_iso, today, today, user_id),
         )
+        await self.conn.commit()
+
+    async def mark_wod(self, user_id: int, today: str) -> None:
+        await self.conn.execute("UPDATE users SET last_wod_date = ? WHERE user_id = ?", (today, user_id))
+        await self.conn.commit()
 
     async def get_user(self, user_id: int) -> User | None:
         row = await self._fetchone("SELECT * FROM users WHERE user_id = ?", (user_id,))
@@ -289,17 +341,31 @@ class Database:
     async def content_counts(self) -> dict[str, int]:
         return {table: await self.count(table) for table in sorted(ALLOWED_TABLES)}
 
-    async def random_item(self, kind: str) -> Any | None:
+    async def random_rows(
+        self, kind: str, where: str = "", params: tuple[Any, ...] = (), n: int = 1, topic_id: int | None = None
+    ) -> list[Any]:
+        """n випадкових записів типу kind. `where` — готовий SQL-фрагмент (лише з наших констант!)."""
         table, model = KIND_TABLES[kind]
-        row = await self._fetchone(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT 1")
-        return model(**dict(row)) if row else None
+        source = READ_SOURCES.get(table, table)
+        conditions = [where] if where else []
+        values = list(params)
+        if topic_id is not None and table == "custom_cards":
+            conditions.append("topic_id = ?")
+            values.append(topic_id)
+        clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = await self._fetchall(f"SELECT * FROM {source}{clause} ORDER BY RANDOM() LIMIT ?", (*values, n))
+        return [model(**dict(row)) for row in rows]
+
+    async def random_item(self, kind: str, topic_id: int | None = None) -> Any | None:
+        rows = await self.random_rows(kind, n=1, topic_id=topic_id)
+        return rows[0] if rows else None
 
     async def get_item(self, kind: str, item_id: int) -> Any | None:
         entry = KIND_TABLES.get(kind)
         if entry is None:
             return None
         table, model = entry
-        row = await self._fetchone(f"SELECT * FROM {table} WHERE id = ?", (item_id,))
+        row = await self._fetchone(f"SELECT * FROM {READ_SOURCES.get(table, table)} WHERE id = ?", (item_id,))
         return model(**dict(row)) if row else None
 
     async def add_history_date(self, year: str, event: str) -> int:
@@ -348,7 +414,7 @@ class Database:
         """Сторінка записів певного типу, за зростанням id."""
         table, model = KIND_TABLES[kind]
         rows = await self._fetchall(
-            f"SELECT * FROM {table} ORDER BY id LIMIT ? OFFSET ?", (limit, offset)
+            f"SELECT * FROM {READ_SOURCES.get(table, table)} ORDER BY id LIMIT ? OFFSET ?", (limit, offset)
         )
         return [model(**dict(row)) for row in rows]
 
@@ -356,8 +422,240 @@ class Database:
         """Видаляє запис. Повертає True, якщо запис існував."""
         table, _ = KIND_TABLES[kind]
         cursor = await self.conn.execute(f"DELETE FROM {table} WHERE id = ?", (item_id,))
+        await self.conn.execute("DELETE FROM progress WHERE kind = ? AND item_id = ?", (kind, item_id))
         await self.conn.commit()
         return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------ прогрес (інтервальне повторення)
+    BOX_DELAYS: dict[int, timedelta] = {
+        1: timedelta(hours=2),    # помилка — повторити скоро
+        2: timedelta(days=1),
+        3: timedelta(days=3),
+        4: timedelta(days=7),
+        5: timedelta(days=21),
+    }
+
+    async def record_review(
+        self, user_id: int, kind: str, item_id: int, ok: bool, source: str = "card", now: datetime | None = None
+    ) -> int:
+        """Записує відповідь («знав» / «не знав» чи квіз) і зсуває картку між «коробками». Повертає нову коробку."""
+        now = now or datetime.now(timezone.utc)
+        iso = now.isoformat(timespec="seconds")
+        row = await self._fetchone(
+            "SELECT box FROM progress WHERE user_id = ? AND kind = ? AND item_id = ?", (user_id, kind, item_id)
+        )
+        box = row["box"] if row else 0
+        new_box = min(5, max(box, 1) + 1) if ok else 1
+        due = (now + self.BOX_DELAYS[new_box]).isoformat(timespec="seconds")
+        await self.conn.execute(
+            "INSERT INTO progress (user_id, kind, item_id, box, due_at, seen, correct, wrong, last_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) "
+            "ON CONFLICT(user_id, kind, item_id) DO UPDATE SET box = excluded.box, due_at = excluded.due_at, "
+            "seen = seen + 1, correct = correct + excluded.correct, wrong = wrong + excluded.wrong, "
+            "last_at = excluded.last_at",
+            (user_id, kind, item_id, new_box, due, int(ok), int(not ok), iso),
+        )
+        await self.conn.execute(
+            "INSERT INTO reviews (user_id, kind, item_id, ok, source, at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, kind, item_id, int(ok), source, iso),
+        )
+        await self.conn.commit()
+        return new_box
+
+    async def get_progress(self, user_id: int, kind: str, item_id: int) -> aiosqlite.Row | None:
+        return await self._fetchone(
+            "SELECT * FROM progress WHERE user_id = ? AND kind = ? AND item_id = ?", (user_id, kind, item_id)
+        )
+
+    @staticmethod
+    def _progress_filter(kinds: list[str], custom_topic_id: int | None) -> tuple[str, list[Any]]:
+        placeholders = ", ".join("?" for _ in kinds)
+        clause = f"kind IN ({placeholders})"
+        values: list[Any] = list(kinds)
+        if custom_topic_id is not None:
+            clause += " AND (kind != 'q' OR item_id IN (SELECT id FROM custom_cards WHERE topic_id = ?))"
+            values.append(custom_topic_id)
+        return clause, values
+
+    async def due_items(
+        self, user_id: int, kinds: list[str], now_iso: str, custom_topic_id: int | None = None, limit: int = 20
+    ) -> list[tuple[str, int]]:
+        """Картки, які пора повторити (спершу найслабші «коробки»)."""
+        clause, values = self._progress_filter(kinds, custom_topic_id)
+        rows = await self._fetchall(
+            f"SELECT kind, item_id FROM progress WHERE user_id = ? AND box > 0 AND due_at != '' AND due_at <= ? "
+            f"AND {clause} ORDER BY box ASC, due_at ASC LIMIT ?",
+            (user_id, now_iso, *values, limit),
+        )
+        return [(row["kind"], row["item_id"]) for row in rows]
+
+    async def mistake_items(
+        self, user_id: int, kinds: list[str], custom_topic_id: int | None = None, limit: int = 30
+    ) -> list[tuple[str, int]]:
+        """Картки, де остання відповідь була «не знав» (коробка 1)."""
+        clause, values = self._progress_filter(kinds, custom_topic_id)
+        rows = await self._fetchall(
+            f"SELECT kind, item_id FROM progress WHERE user_id = ? AND box = 1 AND {clause} "
+            f"ORDER BY last_at ASC LIMIT ?",
+            (user_id, *values, limit),
+        )
+        return [(row["kind"], row["item_id"]) for row in rows]
+
+    async def drop_progress(self, user_id: int, kind: str, item_id: int) -> None:
+        await self.conn.execute(
+            "DELETE FROM progress WHERE user_id = ? AND kind = ? AND item_id = ?", (user_id, kind, item_id)
+        )
+        await self.conn.commit()
+
+    async def user_stats(self, user_id: int, now_iso: str) -> dict[str, Any]:
+        by_kind = {
+            row["kind"]: (row["total"], row["ok"] or 0)
+            for row in await self._fetchall(
+                "SELECT kind, COUNT(*) AS total, SUM(ok) AS ok FROM reviews WHERE user_id = ? GROUP BY kind",
+                (user_id,),
+            )
+        }
+        quiz = await self._fetchone(
+            "SELECT COUNT(*) AS total, SUM(ok) AS ok FROM reviews WHERE user_id = ? AND source = 'quiz'", (user_id,)
+        )
+        due = await self._fetchone(
+            "SELECT COUNT(*) FROM progress WHERE user_id = ? AND box > 0 AND due_at != '' AND due_at <= ?",
+            (user_id, now_iso),
+        )
+        mistakes = await self._fetchone("SELECT COUNT(*) FROM progress WHERE user_id = ? AND box = 1", (user_id,))
+        mastered = await self._fetchone("SELECT COUNT(*) FROM progress WHERE user_id = ? AND box >= 4", (user_id,))
+        stamps = [
+            row["at"]
+            for row in await self._fetchall(
+                "SELECT at FROM reviews WHERE user_id = ? ORDER BY at DESC LIMIT 5000", (user_id,)
+            )
+        ]
+        return {
+            "by_kind": by_kind,
+            "quiz": (quiz["total"] or 0, quiz["ok"] or 0),
+            "due": due[0],
+            "mistakes": mistakes[0],
+            "mastered": mastered[0],
+            "stamps": stamps,
+        }
+
+    # ------------------------------------------------------------------ квізи
+    async def add_poll(
+        self, poll_id: str, user_id: int, kind: str, item_id: int, correct: int, session_id: int | None = None
+    ) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO polls (poll_id, user_id, kind, item_id, correct_option, session_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (poll_id, user_id, kind, item_id, correct, session_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await self.conn.commit()
+
+    async def pop_poll(self, poll_id: str) -> aiosqlite.Row | None:
+        row = await self._fetchone("SELECT * FROM polls WHERE poll_id = ?", (poll_id,))
+        if row:
+            await self.conn.execute("DELETE FROM polls WHERE poll_id = ?", (poll_id,))
+            await self.conn.commit()
+        return row
+
+    async def create_session(self, user_id: int, topic: str, total: int) -> int:
+        return await self._insert(
+            "INSERT INTO quiz_sessions (user_id, topic, total) VALUES (?, ?, ?)", (user_id, topic, total)
+        )
+
+    async def get_session(self, session_id: int) -> aiosqlite.Row | None:
+        return await self._fetchone("SELECT * FROM quiz_sessions WHERE id = ?", (session_id,))
+
+    async def advance_session(self, session_id: int, ok: bool) -> aiosqlite.Row | None:
+        await self.conn.execute(
+            "UPDATE quiz_sessions SET done = done + 1, correct = correct + ?, "
+            "finished = (CASE WHEN done + 1 >= total THEN 1 ELSE 0 END) WHERE id = ?",
+            (int(ok), session_id),
+        )
+        await self.conn.commit()
+        return await self.get_session(session_id)
+
+    async def finish_session(self, session_id: int) -> None:
+        await self.conn.execute("UPDATE quiz_sessions SET finished = 1 WHERE id = ?", (session_id,))
+        await self.conn.commit()
+
+    # ------------------------------------------------------------------ інші предмети (довільні завдання)
+    async def custom_topics(self, only_with_cards: bool = True) -> list[aiosqlite.Row]:
+        having = "HAVING cards > 0" if only_with_cards else ""
+        return await self._fetchall(
+            "SELECT t.id AS id, t.name AS name, COUNT(c.id) AS cards FROM custom_topics t "
+            f"LEFT JOIN custom_cards c ON c.topic_id = t.id GROUP BY t.id {having} ORDER BY t.name"
+        )
+
+    async def get_custom_topic(self, topic_id: int) -> aiosqlite.Row | None:
+        return await self._fetchone("SELECT * FROM custom_topics WHERE id = ?", (topic_id,))
+
+    async def add_custom_topic(self, name: str) -> int:
+        """Створює тему (або повертає id існуючої з такою назвою без урахування регістру)."""
+        for row in await self._fetchall("SELECT id, name FROM custom_topics"):
+            if row["name"].lower() == name.lower():
+                return row["id"]
+        return await self._insert("INSERT INTO custom_topics (name) VALUES (?)", (name,))
+
+    async def add_custom_card(self, topic_id: int, question: str, answer: str) -> int:
+        return await self._insert(
+            "INSERT INTO custom_cards (topic_id, question, answer) VALUES (?, ?, ?)", (topic_id, question, answer)
+        )
+
+    # ------------------------------------------------------------------ пошук
+    SEARCH_COLUMNS: dict[str, tuple[str, ...]] = {
+        "d": ("year", "event"),
+        "a": ("word", "note"),
+        "n": ("text", "category"),
+        "f": ("word", "synonym"),
+        "r": ("phrase", "meaning"),
+        "m": ("title", "description"),
+        "q": ("question", "answer", "topic"),
+    }
+
+    async def search(self, query: str, per_kind: int = 5) -> dict[str, list[Any]]:
+        """Пошук підрядка (без урахування регістру й знаків наголосу) за всіма розділами."""
+        needle = query.strip().lower().replace("\u0301", "")
+        pattern = "%" + needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        found: dict[str, list[Any]] = {}
+        for kind, columns in self.SEARCH_COLUMNS.items():
+            table, model = KIND_TABLES[kind]
+            source = READ_SOURCES.get(table, table)
+            cond = " OR ".join(
+                f"ulower(replace({col}, char(769), '')) LIKE ? ESCAPE '\\'" for col in columns
+            )
+            rows = await self._fetchall(
+                f"SELECT * FROM {source} WHERE {cond} ORDER BY id LIMIT ?", (*([pattern] * len(columns)), per_kind)
+            )
+            if rows:
+                found[kind] = [model(**dict(row)) for row in rows]
+        return found
+
+    # ------------------------------------------------------------------ імпорт і бекап
+    async def existing_values(self, table: str, column: str) -> set[str]:
+        if table not in ALLOWED_TABLES or column not in {"year", "event", "word", "note", "text", "phrase", "question", "synonym"}:
+            raise ValueError("Недозволений запит")
+        return {row[0] for row in await self._fetchall(f"SELECT {column} FROM {table}")}
+
+    async def custom_keys(self) -> set[tuple[int, str]]:
+        """Пари (тема, питання) вже наявних завдань — для пропуску дублікатів при імпорті."""
+        return {(row["topic_id"], row["question"].casefold()) for row in await self._fetchall(
+            "SELECT topic_id, question FROM custom_cards"
+        )}
+
+    async def bulk_insert(self, table: str, fields: tuple[str, ...], rows: list[tuple[Any, ...]]) -> None:
+        """Пакетна вставка рядків (для імпорту)."""
+        allowed = {"history_dates", "accents", "foreign_words", "phrases", "mnemonics", "custom_cards"}
+        if table not in allowed:
+            raise ValueError("Недозволена таблиця")
+        await self._insert_rows(table, fields, rows)
+
+    async def backup_to(self, target: Path) -> None:
+        """Цілісна копія бази (VACUUM INTO) — безпечна, поки бот працює."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            target.unlink()
+        await self.conn.commit()
+        await self.conn.execute("VACUUM INTO ?", (str(target),))
 
     # ------------------------------------------------------------------ meta (стан планувальника)
     async def get_meta(self, key: str) -> str | None:

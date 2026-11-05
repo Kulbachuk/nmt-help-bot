@@ -1,13 +1,14 @@
 """Адмін-панель (лише для ADMIN_ID): додавання, перегляд, редагування та видалення матеріалів."""
 from __future__ import annotations
 
+import io
 import logging
 import math
-import re
 from dataclasses import dataclass
+from datetime import tzinfo as TzInfo
 from typing import Callable
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -23,6 +24,7 @@ from aiogram.types import (
 from database.db import Database
 from database.models import (
     KIND_ACCENT,
+    KIND_CUSTOM,
     KIND_DATE,
     KIND_FOREIGN,
     KIND_MNEMONIC,
@@ -30,13 +32,33 @@ from database.models import (
     KIND_PHRASE,
     KIND_TABLES,
 )
+from services import importer
+from services.backup import send_backup
 from services.cards import (
     accent_variants,
+    build_card,
     escape,
     highlight_stress,
-    normalize_accent_word,
-    normalize_mnemonic,
     to_marked,
+)
+from services.quiz import build_quiz
+from services.scheduler import Broadcaster
+from services.validators import (
+    v_answer,
+    v_category,
+    v_date,
+    v_description,
+    v_event,
+    v_foreign_word,
+    v_meaning,
+    v_mnemonic,
+    v_note,
+    v_phrase,
+    v_question,
+    v_synonym,
+    v_title,
+    v_topic_name,
+    v_word,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,111 +74,10 @@ async def is_admin(event: TelegramObject, admin_id: int) -> bool:
 router.message.filter(is_admin)
 router.callback_query.filter(is_admin)
 
-KINDS = "[damnfr]"  # літери типів записів у callback_data (див. database.models)
+KINDS = "[damnfrq]"  # літери типів записів у callback_data (див. database.models)
 
 
-# ====================================================================== перевірка полів
-# Кожен валідатор повертає (значення, "") або (None, текст помилки).
-Result = tuple["str | None", str]
-
-
-def v_date(raw: str) -> Result:
-    """Дата — вільний текст: рік, період, місяць і рік, століття («988», «1932–1933», «травень 1648», «VII–III ст. до н. е.»)."""
-    date = " ".join(raw.split())
-    if not 1 <= len(date) <= 60:
-        return None, (
-            "⚠️ Дата — від 1 до 60 символів. Приклади: <code>988</code>, <code>1932–1933</code>, "
-            "<code>травень 1648</code>, <code>22 січня 1919</code>."
-        )
-    return date, ""
-
-
-def v_event(raw: str) -> Result:
-    event = raw.strip()
-    if not 5 <= len(event) <= 600:
-        return None, "⚠️ Опис події має містити від 5 до 600 символів."
-    return event, ""
-
-
-def v_word(raw: str) -> Result:
-    word = normalize_accent_word(raw)
-    if word is None:
-        return None, (
-            "⚠️ Потрібне одне слово з одним наголосом: наголошена голосна — велика, решта літер — малі "
-            "(приклад: <code>каталОг</code>). Якщо допустимі два варіанти — дві великі голосні "
-            "(<code>мАбУть</code>)."
-        )
-    return word, ""
-
-
-def v_note(raw: str) -> Result:
-    note = raw.strip()
-    if note == "-":
-        note = ""
-    if len(note) > 500:
-        return None, "⚠️ Підказка задовга (максимум 500 символів)."
-    return note, ""
-
-
-def v_title(raw: str) -> Result:
-    title = raw.strip()
-    if not 2 <= len(title) <= 150:
-        return None, "⚠️ Назва має містити від 2 до 150 символів."
-    return title, ""
-
-
-def v_description(raw: str) -> Result:
-    description = raw.strip()
-    if not 5 <= len(description) <= 700:
-        return None, "⚠️ Опис має містити від 5 до 700 символів."
-    return description, ""
-
-
-def v_foreign_word(raw: str) -> Result:
-    word = " ".join(raw.split())
-    if not 2 <= len(word) <= 60:
-        return None, "⚠️ Іншомовне слово — від 2 до 60 символів."
-    return word, ""
-
-
-def v_synonym(raw: str) -> Result:
-    synonym = " ".join(raw.split())
-    if not 2 <= len(synonym) <= 150:
-        return None, "⚠️ Український відповідник — від 2 до 150 символів."
-    return synonym, ""
-
-
-def v_phrase(raw: str) -> Result:
-    phrase = " ".join(raw.split()).strip("«»\"")
-    if not 2 <= len(phrase) <= 120:
-        return None, "⚠️ Фразеологізм — від 2 до 120 символів."
-    return phrase, ""
-
-
-def v_meaning(raw: str) -> Result:
-    meaning = " ".join(raw.split())
-    if not 3 <= len(meaning) <= 500:
-        return None, "⚠️ Значення — від 3 до 500 символів."
-    return meaning, ""
-
-
-def v_category(raw: str) -> Result:
-    category = " ".join(raw.split())
-    if not 2 <= len(category) <= 40:
-        return None, "⚠️ Назва категорії — від 2 до 40 символів."
-    return category, ""
-
-
-def v_mnemonic(raw: str) -> Result:
-    text = normalize_mnemonic(raw)
-    if text is None:
-        return None, (
-            "⚠️ У фразі має бути хоча б один наголос, довжина — від 5 до 300 символів. "
-            "Наголос: велика голосна всередині слова (<code>піцЕрія</code>) або знак наголосу."
-        )
-    return text, ""
-
-
+# ====================================================================== перевірка полів (див. services/validators.py)
 @dataclass(frozen=True, slots=True)
 class Field:
     code: str                              # літера в callback_data
@@ -179,6 +100,10 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("t", "title", "Назву", "Введіть нову <b>назву</b> пам'ятки:", v_title),
         Field("d", "description", "Опис", "Введіть новий <b>опис</b> (до 700 символів):", v_description),
         Field("p", "photo_file_id", "Фото", "Надішліть нове <b>фото</b> (саме як фото, не файл):", None),
+    ),
+    KIND_CUSTOM: (
+        Field("q", "question", "Питання", "Введіть нове <b>питання</b>:", v_question),
+        Field("a", "answer", "Відповідь", "Введіть нову <b>відповідь</b>:", v_answer),
     ),
     KIND_PHRASE: (
         Field("p", "phrase", "Фразеологізм", "Введіть новий <b>фразеологізм</b> (без лапок):", v_phrase),
@@ -231,6 +156,24 @@ class AddForeign(StatesGroup):
     synonym = State()
 
 
+class AddCustomTopic(StatesGroup):
+    name = State()
+
+
+class AddCustomCard(StatesGroup):
+    question = State()
+    answer = State()
+
+
+class Announce(StatesGroup):
+    content = State()
+    confirm = State()
+
+
+class ImportFile(StatesGroup):
+    file = State()
+
+
 class EditValue(StatesGroup):
     value = State()
 
@@ -243,6 +186,7 @@ KIND_LABELS = {
     KIND_MNEMONIC: ("🧠", "Фрази для наголосів"),
     KIND_FOREIGN: ("🌐", "Відповідники іншомовних слів"),
     KIND_PHRASE: ("💬", "Фразеологізми"),
+    KIND_CUSTOM: ("📚", "Інші предмети (завдання)"),
 }
 
 NEED_TEXT = "⚠️ Очікую текстове повідомлення (не команду). Або натисніть /cancel, щоб скасувати."
@@ -255,14 +199,23 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 
 
 MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [_btn("📅 Додати дату", "adm:date")],
-    [_btn("🔤 Додати наголос", "adm:accent")],
-    [_btn("🧠 Додати фразу для наголосів", "adm:mnemonic")],
-    [_btn("🌐 Додати відповідник іншомовного слова", "adm:foreign")],
-    [_btn("💬 Додати фразеологізм", "adm:phrase")],
-    [_btn("🏛 Додати пам'ятку з фото", "adm:monument")],
+    [_btn("➕ Додати матеріал", "adm:addmenu")],
     [_btn("📋 Переглянути / редагувати / видалити", "adm:list")],
+    [_btn("📢 Оголошення всім", "adm:announce")],
+    [_btn("📤 Розсилка завдань зараз", "adm:tb")],
+    [_btn("📥 Імпорт з файлу (CSV/JSON)", "adm:import")],
+    [_btn("💾 Бекап бази", "adm:backup")],
     [_btn("📊 Статистика", "adm:stats")],
+])
+ADD_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [_btn("📅 Дату", "adm:date"), _btn("🔤 Наголос", "adm:accent")],
+    [_btn("🧠 Фразу для наголосів", "adm:mnemonic")],
+    [_btn("🌐 Відповідник іншомовного слова", "adm:foreign")],
+    [_btn("💬 Фразеологізм", "adm:phrase")],
+    [_btn("🏛 Пам'ятку з фото", "adm:monument")],
+    [_btn("📚 Предмет/тему (інші предмети)", "adm:custtopic")],
+    [_btn("📚 Завдання (питання—відповідь)", "adm:custcard")],
+    [_btn("↩️ До меню", "adm:menu")],
 ])
 CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[_btn("✖️ Скасувати", "adm:cancel")]])
 MENU_TEXT = "🛠 <b>Адмін-панель</b>\nОберіть дію:"
@@ -293,6 +246,8 @@ def _preview(kind: str, item) -> str:
         return item.text
     if kind == KIND_PHRASE:
         return f"{item.phrase} — {item.meaning}"
+    if kind == KIND_CUSTOM:
+        return f"[{item.topic}] {item.question} → {item.answer}"
     if kind == KIND_FOREIGN:
         return f"{item.word} — {item.synonym}"
     return item.title
@@ -310,6 +265,11 @@ def _item_text(kind: str, item) -> str:
         return head + f"Слово: <b>{escape(shown)}</b> ({escape(item.word)}){note}"
     if kind == KIND_PHRASE:
         return head + f"Фразеологізм: <b>{escape(item.phrase)}</b>\nЗначення: {escape(item.meaning)}"
+    if kind == KIND_CUSTOM:
+        return head + (
+            f"Предмет/тема: <b>{escape(item.topic)}</b>\nПитання: {escape(item.question)}\n"
+            f"Відповідь: {escape(item.answer)}"
+        )
     if kind == KIND_FOREIGN:
         return head + f"Іншомовне слово: <b>{escape(item.word)}</b>\nВідповідник: {escape(item.synonym)}"
     if kind == KIND_MNEMONIC:
@@ -409,6 +369,13 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await _show(callback, MENU_TEXT, MENU_KB)
 
 
+@router.callback_query(F.data == "adm:addmenu")
+async def cb_add_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    await _show(callback, "➕ <b>Що додати?</b>", ADD_KB)
+
+
 @router.callback_query(F.data == "adm:noop")
 async def cb_noop(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -429,7 +396,8 @@ async def cb_stats(callback: CallbackQuery, db: Database) -> None:
         f"🔤 Наголоси: <b>{counts.get('accents', 0)}</b>\n"
         f"🧠 Фрази для наголосів: <b>{counts.get('mnemonics', 0)}</b>\n"
         f"🌐 Відповідники іншомовних слів: <b>{counts.get('foreign_words', 0)}</b>\n"
-        f"💬 Фразеологізми: <b>{counts.get('phrases', 0)}</b>"
+        f"💬 Фразеологізми: <b>{counts.get('phrases', 0)}</b>\n"
+        f"📚 Інші предмети (завдання): <b>{counts.get('custom_cards', 0)}</b>"
     )
     if isinstance(callback.message, Message):
         await callback.message.answer(text)
@@ -998,3 +966,348 @@ async def cb_delete_confirm(callback: CallbackQuery, db: Database) -> None:
     logger.info("Адмін видалив запис %s#%s (існував: %s)", kind, raw_id, deleted)
     await callback.answer("🗑 Видалено" if deleted else "Запис уже було видалено")
     await _show_list(callback, db, kind, int(raw_page))
+
+
+# ====================================================================== інші предмети: тема та завдання
+@router.callback_query(F.data == "adm:custtopic")
+async def cb_add_custom_topic(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(AddCustomTopic.name)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "📚 Введіть <b>назву предмета/теми</b> (наприклад: <code>Математика</code>, <code>Англійська</code>):",
+            reply_markup=CANCEL_KB,
+        )
+
+
+@router.message(AddCustomTopic.name)
+async def add_custom_topic_name(message: Message, state: FSMContext, db: Database) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    name, error = v_topic_name(raw)
+    if name is None:
+        await message.answer(error)
+        return
+    topic_id = await db.add_custom_topic(name)
+    await state.clear()
+    logger.info("Адмін створив/обрав тему «%s» (#%s)", name, topic_id)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("➕ Додати завдання в цю тему", f"adm:cc:{topic_id}")],
+        [_btn("↩️ До меню", "adm:menu")],
+    ])
+    await message.answer(
+        f"✅ Тема <b>{escape(name)}</b> готова. Вона з'явиться в /now, /quiz і налаштуваннях, щойно в ній буде "
+        "хоча б одне завдання.",
+        reply_markup=markup,
+    )
+
+
+@router.callback_query(F.data == "adm:custcard")
+async def cb_add_custom_card(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    await state.clear()
+    await callback.answer()
+    topics = await db.custom_topics(only_with_cards=False)
+    rows = [[_btn(f"📚 {t['name']} ({t['cards']})", f"adm:cc:{t['id']}")] for t in topics]
+    rows.append([_btn("➕ Нова тема", "adm:custtopic")])
+    rows.append([_btn("✖️ Скасувати", "adm:cancel")])
+    text = "📚 Оберіть <b>тему</b> для нового завдання:" if topics else "📚 Тем ще немає — спочатку створіть тему:"
+    if isinstance(callback.message, Message):
+        await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm:cc:(\d+)$"))
+async def cb_custom_card_topic(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    topic = await db.get_custom_topic(int((callback.data or "").split(":")[2]))
+    if topic is None:
+        await callback.answer("Тему не знайдено.", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(AddCustomCard.question)
+    await state.update_data(topic_id=topic["id"], topic_name=topic["name"])
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            f"Тема: <b>{escape(topic['name'])}</b>\nВведіть <b>питання</b> (завдання):", reply_markup=CANCEL_KB
+        )
+
+
+@router.message(AddCustomCard.question)
+async def add_custom_card_question(message: Message, state: FSMContext) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    question, error = v_question(raw)
+    if question is None:
+        await message.answer(error)
+        return
+    await state.update_data(question=question)
+    await state.set_state(AddCustomCard.answer)
+    await message.answer("Тепер введіть <b>відповідь</b> (її бот покаже за кнопкою):", reply_markup=CANCEL_KB)
+
+
+@router.message(AddCustomCard.answer)
+async def add_custom_card_answer(message: Message, state: FSMContext, db: Database) -> None:
+    raw = _text(message)
+    if raw is None:
+        await message.answer(NEED_TEXT)
+        return
+    answer, error = v_answer(raw)
+    if answer is None:
+        await message.answer(error)
+        return
+    data = await state.get_data()
+    try:
+        item_id = await db.add_custom_card(data["topic_id"], data["question"], answer)
+    except Exception:
+        logger.exception("Не вдалося зберегти завдання")
+        await message.answer("😔 Помилка збереження в базу. Подробиці — у логах.")
+        return
+    await state.clear()
+    logger.info("Адмін додав завдання #%s у тему %s", item_id, data["topic_name"])
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("➕ Ще одне завдання в цю тему", f"adm:cc:{data['topic_id']}")],
+        [_btn("↩️ До меню", "adm:menu")],
+    ])
+    await message.answer(f"✅ Завдання додано (№{item_id}) у тему <b>{escape(data['topic_name'])}</b>.", reply_markup=markup)
+
+
+# ====================================================================== оголошення всім користувачам
+@router.callback_query(F.data == "adm:announce")
+async def cb_announce(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(Announce.content)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "📢 <b>Оголошення</b>\n\nНадішліть текст оголошення (можна із форматуванням Telegram: жирний, курсив, "
+            "посилання) або <b>фото з підписом</b>. Воно піде <b>всім активним користувачам негайно</b>, незалежно "
+            "від часу й тихого режиму. Спочатку я покажу попередній перегляд.",
+            reply_markup=CANCEL_KB,
+        )
+
+
+@router.message(Announce.content)
+async def announce_content(message: Message, state: FSMContext, db: Database) -> None:
+    photo = None
+    if message.photo:
+        photo = message.photo[-1].file_id
+        html = message.html_text if message.caption else ""
+        limit = 1024
+    elif message.text and not message.text.startswith("/"):
+        html = message.html_text
+        limit = 4096
+    else:
+        await message.answer(NEED_TEXT)
+        return
+    if len(html) > limit:
+        await message.answer(f"⚠️ Занадто довго: {len(html)} символів (максимум {limit}).")
+        return
+
+    await state.update_data(html=html, photo=photo)
+    await state.set_state(Announce.confirm)
+    recipients = await db.count_users(only_active=True)
+    if photo:
+        await message.answer_photo(photo, caption=html or None)
+    else:
+        await message.answer(html)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"✅ Надіслати ({recipients})", "adm:an:go")],
+        [_btn("✖️ Скасувати", "adm:cancel")],
+    ])
+    await message.answer(
+        f"☝️ Так виглядатиме оголошення. Надіслати <b>{recipients}</b> активним користувачам?", reply_markup=markup
+    )
+
+
+@router.callback_query(Announce.confirm, F.data == "adm:an:go")
+async def announce_go(callback: CallbackQuery, state: FSMContext, broadcaster: Broadcaster) -> None:
+    data = await state.get_data()
+    await state.clear()
+    await callback.answer("Надсилаю…")
+    if not isinstance(callback.message, Message):
+        return
+    await callback.message.answer("⏳ Надсилаю оголошення…")
+    sent, failed = await broadcaster.send_text_to_all(data.get("html", ""), data.get("photo"))
+    logger.info("Оголошення надіслано: успішно %d, помилок %d", sent, failed)
+    await callback.message.answer(f"✅ Оголошення надіслано: успішно <b>{sent}</b>, помилок <b>{failed}</b>.")
+    await _show_menu(callback.message)
+
+
+# ====================================================================== розсилка завдань (картка/квіз) незалежно від часу
+TB_TOPICS = (
+    ("hist", "🏛 Історія України"),
+    ("lang", "🔤 Українська мова"),
+    ("acc", "🔊 Наголоси"),
+    ("for", "🌐 Іншомовні слова"),
+    ("phr", "💬 Фразеологізми"),
+    ("any", "🎲 Випадкова тема"),
+)
+TB_MODES = {"card": "картку", "quiz": "квіз-опитування"}
+TB_RE = r"(card|quiz):(hist|lang|any|oth|acc|for|phr|c\d+)"
+
+
+@router.callback_query(F.data == "adm:tb")
+async def cb_tb(callback: CallbackQuery) -> None:
+    await callback.answer()
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🃏 Картка (текст)", "adm:tbm:card")],
+        [_btn("🎯 Квіз-опитування", "adm:tbm:quiz")],
+        [_btn("↩️ До меню", "adm:menu")],
+    ])
+    await _show(
+        callback,
+        "📤 <b>Розсилка завдань</b>\n\nНадішле одне завдання <b>всім активним користувачам негайно</b> — "
+        "незалежно від розкладу, ліміту й тихого режиму. Що надіслати?",
+        markup,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^adm:tbm:(card|quiz)$"))
+async def cb_tb_mode(callback: CallbackQuery, db: Database) -> None:
+    mode = (callback.data or "").split(":")[2]
+    await callback.answer()
+    rows = [[_btn(label, f"adm:tbt:{mode}:{topic}")] for topic, label in TB_TOPICS]
+    for topic in (await db.custom_topics())[:8]:
+        rows.append([_btn(f"📚 {topic['name']}", f"adm:tbt:{mode}:c{topic['id']}")])
+    rows.append([_btn("↩️ Назад", "adm:tb")])
+    await _show(callback, f"Оберіть тему для розсилки: <b>{TB_MODES[mode]}</b>", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def _tb_topic_label(db: Database, topic: str) -> str:
+    if topic.startswith("c") and topic[1:].isdigit():
+        row = await db.get_custom_topic(int(topic[1:]))
+        return f"📚 {row['name']}" if row else topic
+    return dict(TB_TOPICS).get(topic, topic)
+
+
+@router.callback_query(F.data.regexp(rf"^adm:tbt:{TB_RE}$"))
+async def cb_tb_confirm(callback: CallbackQuery, db: Database) -> None:
+    mode, topic = (callback.data or "").split(":")[2:4]
+    await callback.answer()
+    recipients = await db.count_users(only_active=True)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"✅ Надіслати ({recipients})", f"adm:tbg:{mode}:{topic}")],
+        [_btn("✖️ Скасувати", "adm:menu")],
+    ])
+    label = await _tb_topic_label(db, topic)
+    await _show(
+        callback,
+        f"Надіслати <b>{TB_MODES[mode]}</b> з теми «{escape(label)}» усім <b>{recipients}</b> активним користувачам зараз?",
+        markup,
+    )
+
+
+@router.callback_query(F.data.regexp(rf"^adm:tbg:{TB_RE}$"))
+async def cb_tb_go(callback: CallbackQuery, db: Database, broadcaster: Broadcaster) -> None:
+    mode, topic = (callback.data or "").split(":")[2:4]
+    if mode == "card":
+        card = await build_card(db, topic, None)
+        spec = None
+        ready = card is not None
+    else:
+        card = None
+        spec = await build_quiz(db, topic, None)
+        ready = spec is not None
+    if not ready:
+        await callback.answer("Для цієї теми немає матеріалів.", show_alert=True)
+        return
+    await callback.answer("Надсилаю…")
+    if not isinstance(callback.message, Message):
+        return
+    await callback.message.answer("⏳ Надсилаю…")
+    if card is not None:
+        sent, failed = await broadcaster.send_card_to_all(card, more=topic)
+    else:
+        sent, failed = await broadcaster.send_quiz_to_all(spec)
+    logger.info("Розсилка завдання (%s, %s): успішно %d, помилок %d", mode, topic, sent, failed)
+    await callback.message.answer(f"✅ Розсилку завершено: успішно <b>{sent}</b>, помилок <b>{failed}</b>.")
+    await _show_menu(callback.message)
+
+
+# ====================================================================== бекап бази
+@router.callback_query(F.data == "adm:backup")
+async def cb_backup(callback: CallbackQuery, bot: Bot, db: Database, tz: TzInfo) -> None:
+    await callback.answer("Готую копію…")
+    ok = await send_backup(bot, db, callback.from_user.id, tz)
+    if not ok and isinstance(callback.message, Message):
+        await callback.message.answer("😔 Не вдалося створити бекап. Подробиці — у логах.")
+
+
+# ====================================================================== імпорт із файлу
+IMPORT_HELP = {
+    "d": "дата;подія",
+    "a": "слово з наголосом;підказка (необов'язково)",
+    "f": "іншомовне слово;український відповідник",
+    "r": "фразеологізм;значення",
+    "n": "категорія;фраза з наголосами",
+    "q": "предмет/тема;питання;відповідь",
+}
+
+
+@router.callback_query(F.data == "adm:import")
+async def cb_import(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    rows = [[_btn(spec.title, f"adm:imp:{kind}")] for kind, spec in importer.SPECS.items()]
+    rows.append([_btn("↩️ До меню", "adm:menu")])
+    await _show(callback, "📥 <b>Імпорт з файлу</b>\nКуди імпортувати?", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm:imp:[dafrnq]$"))
+async def cb_import_kind(callback: CallbackQuery, state: FSMContext) -> None:
+    kind = (callback.data or "").split(":")[2]
+    spec = importer.SPECS[kind]
+    await callback.answer()
+    await state.set_state(ImportFile.file)
+    await state.update_data(kind=kind)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            f"📥 <b>Імпорт: {spec.title}</b>\n\n"
+            "Надішліть файл <b>.csv</b> або <b>.json</b> (UTF-8, до 2 МБ).\n"
+            f"Колонки CSV (розділювач <code>;</code> або <code>,</code>): <i>{escape(IMPORT_HELP[kind])}</i>\n"
+            f"Приклад рядка:\n<code>{escape(spec.example)}</code>\n\n"
+            "Рядок-заголовок необов'язковий. Дублікати пропускаються, помилкові рядки буде перелічено.",
+            reply_markup=CANCEL_KB,
+        )
+
+
+@router.message(ImportFile.file, F.document)
+async def import_file(message: Message, state: FSMContext, bot: Bot, db: Database) -> None:
+    data = await state.get_data()
+    kind = data.get("kind")
+    document = message.document
+    if kind not in importer.SPECS or document is None:
+        await state.clear()
+        await message.answer("⚠️ Стан імпорту втрачено. Почніть заново з /admin.")
+        return
+    if (document.file_size or 0) > importer.MAX_BYTES:
+        await message.answer("⚠️ Файл завеликий (максимум 2 МБ).")
+        return
+    buffer = io.BytesIO()
+    try:
+        await bot.download(document, destination=buffer)
+    except Exception:
+        logger.exception("Не вдалося завантажити файл імпорту")
+        await message.answer("😔 Не вдалося завантажити файл. Спробуйте ще раз.")
+        return
+    await state.clear()
+    result = await importer.run_import(db, kind, document.file_name or "", buffer.getvalue())
+    if result.fatal:
+        await message.answer(f"⚠️ Імпорт не виконано: {escape(result.fatal)}")
+    else:
+        lines = [
+            "✅ <b>Імпорт завершено</b>",
+            f"Додано: <b>{result.added}</b>",
+            f"Пропущено дублікатів: <b>{result.skipped}</b>",
+            f"Рядків із помилками: <b>{len(result.errors)}</b>",
+        ]
+        if result.errors:
+            lines += ["", "Перші помилки:"] + [f"• {escape(e)}" for e in result.errors[:5]]
+        await message.answer("\n".join(lines))
+    await _show_menu(message)
+
+
+@router.message(ImportFile.file)
+async def import_file_invalid(message: Message) -> None:
+    await message.answer("⚠️ Очікую файл (.csv або .json). Надішліть його як документ або натисніть /cancel.")

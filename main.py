@@ -19,6 +19,11 @@ from dotenv import load_dotenv
 
 from database.db import Database
 from handlers import admin, start, user
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from services.backup import send_backup
+from services.notify import AdminNotifier, announce_start, heartbeat
 from services.scheduler import schedule_catch_up, setup_scheduler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -103,7 +108,8 @@ async def main() -> None:
 
     # ---- бот і диспетчер (db та admin_id стають доступними в хендлерах і фільтрах за іменем)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage(), db=db, admin_id=admin_id)
+    notifier = AdminNotifier(bot, admin_id)
+    dp = Dispatcher(storage=MemoryStorage(), db=db, admin_id=admin_id, tz=tz)
     dp.include_router(admin.router)  # першим: щоб FSM-стани адміна мали пріоритет
     dp.include_router(start.router)
     dp.include_router(user.router)
@@ -111,9 +117,11 @@ async def main() -> None:
     @dp.errors()
     async def on_error(event: ErrorEvent) -> bool:
         logger.error("Необроблена помилка в апдейті: %s", event.exception, exc_info=event.exception)
+        await notifier.error(event.exception, "апдейт")  # адмін дізнається про серйозні збої (не частіше раз на 10 хв)
         return True  # помилку оброблено, бот продовжує працювати
 
     scheduler, broadcaster = setup_scheduler(bot, db, tz)
+    dp.workflow_data["broadcaster"] = broadcaster  # потрібен адмін-панелі для розсилок
 
     try:
         me = await wait_for_telegram(bot)
@@ -122,6 +130,11 @@ async def main() -> None:
             user_commands = [
                 BotCommand(command="start", description="Реєстрація та інструкція"),
                 BotCommand(command="now", description="Отримати картку зараз"),
+                BotCommand(command="quiz", description="Квіз: 10 питань-опитувань"),
+                BotCommand(command="mistakes", description="Повторити помилки"),
+                BotCommand(command="stats", description="Моя статистика"),
+                BotCommand(command="find", description="Пошук по базі"),
+                BotCommand(command="settings", description="Налаштування"),
                 BotCommand(command="quiet", description="Налаштувати тихий режим"),
                 BotCommand(command="stop", description="Призупинити розсилку"),
                 BotCommand(command="help", description="Довідка"),
@@ -134,12 +147,22 @@ async def main() -> None:
         except Exception:
             logger.exception("Не вдалося встановити меню команд (не критично)")
 
+        # «пульс» кожні 10 хвилин: за ним після відключення світла видно тривалість паузи
+        scheduler.add_job(heartbeat, IntervalTrigger(minutes=10), args=[db, tz], id="heartbeat", replace_existing=True)
+        if os.getenv("AUTO_BACKUP", "1") != "0":
+            # щоденна копія бази адміну в Telegram (вимкнути: AUTO_BACKUP=0)
+            scheduler.add_job(
+                send_backup, CronTrigger(hour=4, minute=5, timezone=tz),
+                args=[bot, db, admin_id, tz, "💾 Щоденна резервна копія"], id="auto_backup", replace_existing=True,
+            )
         scheduler.start()
-        schedule_catch_up(scheduler, broadcaster, tz)  # якщо була пауза — надішле одну пропущену картку
+        schedule_catch_up(scheduler, broadcaster, tz)  # якщо була пауза — надішле пропущені картки
+        await announce_start(notifier, db, tz)
         logger.info("Бот @%s запущено. Адмін: %s, часовий пояс: %s", me.username, admin_id, tz_name)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Зупинка бота...")
+        await heartbeat(db, tz)
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await bot.session.close()
